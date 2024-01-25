@@ -20,10 +20,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
 
+	"github.com/containrrr/shoutrrr"
+	"github.com/containrrr/shoutrrr/pkg/router"
+	sTypes "github.com/containrrr/shoutrrr/pkg/types"
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/cli/cli/flags"
 	"github.com/docker/distribution/reference"
@@ -43,6 +47,19 @@ type Swarm struct {
 	Blacklist   []*regexp.Regexp
 	LabelEnable bool
 	MaxThreads  int
+
+	shoutrrr *router.ServiceRouter
+}
+
+func (c *Swarm) AddNotificationUris(uris []string) {
+	log.Printf("creating notification router")
+	s, err := shoutrrr.CreateSender(uris...)
+	if err != nil {
+		log.Errorf("error creating shoutrrr instance: %s", err.Error())
+		return
+	}
+
+	c.shoutrrr = s
 }
 
 func (c *Swarm) validService(service *swarm.Service) bool {
@@ -148,7 +165,11 @@ func (c *Swarm) updateService(ctx context.Context, service *swarm.Service) error
 	current := updatedService.Spec.TaskTemplate.ContainerSpec.Image
 
 	if previous != current {
-		log.Printf("Service %s updated to %s", service.Spec.Name, current)
+		msg := fmt.Sprintf("Service %s updated to %s", service.Spec.Name, current)
+		log.Printf(msg)
+		if c.shoutrrr != nil {
+			c.shoutrrr.Enqueue(msg)
+		}
 	} else {
 		log.Debug("Service %s is up to date", service.Spec.Name)
 	}
@@ -159,6 +180,18 @@ func (c *Swarm) updateService(ctx context.Context, service *swarm.Service) error
 // UpdateServices updates all the services from a Docker swarm that matches the specified image name.
 // If no images are passed then it updates all the services.
 func (c *Swarm) UpdateServices(ctx context.Context, imageName ...string) error {
+	hostname, err := os.Hostname()
+	if err != nil {
+		log.Errorf("could not get hostname: %s", err.Error())
+		hostname = "unknown"
+	}
+
+	shoutrrrParams := &sTypes.Params{
+		sTypes.TitleKey: fmt.Sprintf("Swarm updater running on %s", hostname),
+	}
+
+	defer c.shoutrrr.Flush(shoutrrrParams)
+
 	services, err := c.serviceList(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get service list: %w", err)
