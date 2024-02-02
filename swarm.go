@@ -108,7 +108,7 @@ func (c *Swarm) serviceList(ctx context.Context) ([]swarm.Service, error) {
 	return services, nil
 }
 
-func (c *Swarm) updateService(ctx context.Context, service swarm.Service) error {
+func (c *Swarm) updateService(ctx context.Context, service swarm.Service, servicesUpdated chan int) error {
 	log.Printf("updating service %s", service.Spec.Name)
 
 	image := service.Spec.TaskTemplate.ContainerSpec.Image
@@ -165,6 +165,7 @@ func (c *Swarm) updateService(ctx context.Context, service swarm.Service) error 
 	current := updatedService.Spec.TaskTemplate.ContainerSpec.Image
 
 	if previous != current {
+		servicesUpdated <- 1
 		msg := fmt.Sprintf("Service %s updated to %s", service.Spec.Name, current)
 		log.Printf(msg)
 		if c.shoutrrr != nil {
@@ -190,7 +191,7 @@ func (c *Swarm) UpdateServices(ctx context.Context, imageName ...string) error {
 		sTypes.TitleKey: fmt.Sprintf("Swarm updater running on %s", hostname),
 	}
 
-	defer c.shoutrrr.Flush(shoutrrrParams)
+	servicesUpdated := make(chan int)
 
 	services, err := c.serviceList(ctx)
 	if err != nil {
@@ -259,7 +260,7 @@ func (c *Swarm) UpdateServices(ctx context.Context, imageName ...string) error {
 					}
 				}
 
-				if err = c.updateService(ctx, service); err != nil {
+				if err = c.updateService(ctx, service, servicesUpdated); err != nil {
 					if ctx.Err() == context.Canceled {
 						log.Printf("Service update canceled")
 						return
@@ -282,6 +283,10 @@ func (c *Swarm) UpdateServices(ctx context.Context, imageName ...string) error {
 				log.Printf("Cannot update service %s: %s", swarmUpdaterService.Spec.Name, err.Error())
 			}
 		}
+	}
+
+	if <-servicesUpdated > 0 {
+		c.shoutrrr.Flush(shoutrrrParams)
 	}
 
 	log.Printf("done")
