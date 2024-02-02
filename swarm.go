@@ -41,6 +41,8 @@ const serviceLabel string = "xyz.megpoid.swarm-updater"
 const updateOnlyLabel string = "xyz.megpoid.swarm-updater.update-only"
 const enabledServiceLabel string = "xyz.megpoid.swarm-updater.enable"
 
+var servicesUpdated int = 0
+
 // Swarm struct to handle all the service operations
 type Swarm struct {
 	client      DockerClient
@@ -108,7 +110,7 @@ func (c *Swarm) serviceList(ctx context.Context) ([]swarm.Service, error) {
 	return services, nil
 }
 
-func (c *Swarm) updateService(ctx context.Context, service swarm.Service, servicesUpdated chan int) error {
+func (c *Swarm) updateService(ctx context.Context, service swarm.Service) error {
 	log.Printf("updating service %s", service.Spec.Name)
 
 	image := service.Spec.TaskTemplate.ContainerSpec.Image
@@ -165,7 +167,7 @@ func (c *Swarm) updateService(ctx context.Context, service swarm.Service, servic
 	current := updatedService.Spec.TaskTemplate.ContainerSpec.Image
 
 	if previous != current {
-		servicesUpdated <- 1
+		servicesUpdated++
 		msg := fmt.Sprintf("Service %s updated to %s", service.Spec.Name, current)
 		log.Printf(msg)
 		if c.shoutrrr != nil {
@@ -190,8 +192,6 @@ func (c *Swarm) UpdateServices(ctx context.Context, imageName ...string) error {
 	shoutrrrParams := &sTypes.Params{
 		sTypes.TitleKey: fmt.Sprintf("Swarm updater running on %s", hostname),
 	}
-
-	servicesUpdated := make(chan int)
 
 	services, err := c.serviceList(ctx)
 	if err != nil {
@@ -260,7 +260,7 @@ func (c *Swarm) UpdateServices(ctx context.Context, imageName ...string) error {
 					}
 				}
 
-				if err = c.updateService(ctx, service, servicesUpdated); err != nil {
+				if err = c.updateService(ctx, service); err != nil {
 					if ctx.Err() == context.Canceled {
 						log.Printf("Service update canceled")
 						return
@@ -285,7 +285,8 @@ func (c *Swarm) UpdateServices(ctx context.Context, imageName ...string) error {
 		}
 	}
 
-	if <-servicesUpdated > 0 {
+	if servicesUpdated > 0 {
+		c.shoutrrr.Enqueue("approx "+servicesUpdated+" services updated")
 		c.shoutrrr.Flush(shoutrrrParams)
 	}
 
