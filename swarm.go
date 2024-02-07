@@ -288,6 +288,9 @@ func (c *Swarm) UpdateServices(ctx context.Context, imageName ...string) error {
 	if servicesUpdated > 0 {
 		c.shoutrrr.Enqueue(fmt.Sprintf("approx %d services updated", servicesUpdated))
 		c.shoutrrr.Flush(shoutrrrParams)
+
+		// now reset the counter back to 0
+		servicesUpdated = 0
 	}
 
 	log.Printf("done")
