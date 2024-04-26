@@ -53,6 +53,10 @@ func run(c *cli.Context) error {
 
 	swarm.LabelEnable = c.Bool("label-enable")
 	swarm.Blacklist = blacklist
+	swarm.MaxThreads = c.Int("max-threads")
+
+	swarm.AddNotificationUris(c.StringSlice("notification-uris"))
+
 	schedule := c.String("schedule")
 
 	// update the services and exit, if requested
@@ -213,6 +217,17 @@ func main() {
 			Name:   "apikey, k",
 			Usage:  "api key to protect endpoint",
 			EnvVar: "APIKEY",
+		},
+		cli.IntFlag{
+			Name:   "max-threads, m",
+			Usage:  "max threads",
+			EnvVar: "MAX_THREADS",
+			Value:  2,
+		},
+		cli.StringSliceFlag{
+			Name:   "notification-uris, n",
+			Usage:  "shoutrrr notification uris for container updates",
+			EnvVar: "NOTIFICATION_URIS",
 		},
 	}
 

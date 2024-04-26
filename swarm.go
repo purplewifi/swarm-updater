@@ -20,9 +20,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
+	"sync"
 
+	"github.com/containrrr/shoutrrr"
+	"github.com/containrrr/shoutrrr/pkg/router"
+	sTypes "github.com/containrrr/shoutrrr/pkg/types"
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/cli/cli/flags"
 	"github.com/docker/distribution/reference"
@@ -36,11 +41,27 @@ const serviceLabel string = "xyz.megpoid.swarm-updater"
 const updateOnlyLabel string = "xyz.megpoid.swarm-updater.update-only"
 const enabledServiceLabel string = "xyz.megpoid.swarm-updater.enable"
 
+var servicesUpdated int = 0
+
 // Swarm struct to handle all the service operations
 type Swarm struct {
 	client      DockerClient
 	Blacklist   []*regexp.Regexp
 	LabelEnable bool
+	MaxThreads  int
+
+	shoutrrr *router.ServiceRouter
+}
+
+func (c *Swarm) AddNotificationUris(uris []string) {
+	log.Printf("creating notification router")
+	s, err := shoutrrr.CreateSender(uris...)
+	if err != nil {
+		log.Errorf("error creating shoutrrr instance: %s", err.Error())
+		return
+	}
+
+	c.shoutrrr = s
 }
 
 func (c *Swarm) validService(service swarm.Service) bool {
@@ -90,6 +111,8 @@ func (c *Swarm) serviceList(ctx context.Context) ([]swarm.Service, error) {
 }
 
 func (c *Swarm) updateService(ctx context.Context, service swarm.Service) error {
+	log.Printf("updating service %s", service.Spec.Name)
+
 	image := service.Spec.TaskTemplate.ContainerSpec.Image
 	updateOpts := types.ServiceUpdateOptions{}
 
@@ -144,7 +167,12 @@ func (c *Swarm) updateService(ctx context.Context, service swarm.Service) error 
 	current := updatedService.Spec.TaskTemplate.ContainerSpec.Image
 
 	if previous != current {
-		log.Printf("Service %s updated to %s", service.Spec.Name, current)
+		servicesUpdated++
+		msg := fmt.Sprintf("Service %s updated to %s", service.Spec.Name, current)
+		log.Printf(msg)
+		if c.shoutrrr != nil {
+			c.shoutrrr.Enqueue(msg)
+		}
 	} else {
 		log.Debug("Service %s is up to date", service.Spec.Name)
 	}
@@ -155,64 +183,117 @@ func (c *Swarm) updateService(ctx context.Context, service swarm.Service) error 
 // UpdateServices updates all the services from a Docker swarm that matches the specified image name.
 // If no images are passed then it updates all the services.
 func (c *Swarm) UpdateServices(ctx context.Context, imageName ...string) error {
+	hostname, err := os.Hostname()
+	if err != nil {
+		log.Errorf("could not get hostname: %s", err.Error())
+		hostname = "unknown"
+	}
+
+	shoutrrrParams := &sTypes.Params{
+		sTypes.TitleKey: fmt.Sprintf("Swarm updater running on %s", hostname),
+	}
+
 	services, err := c.serviceList(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get service list: %w", err)
 	}
 
-	var serviceID string
+	log.Printf("found %d services", len(services))
 
+	wg := sync.WaitGroup{}
+	serviceLock := sync.Mutex{}
+
+	var swarmUpdaterService swarm.Service = swarm.Service{ID: "na"}
+	var serviceQueue []swarm.Service = make([]swarm.Service, 0)
+
+	// find swarm-updater and remove itself from the list to update last
 	for _, service := range services {
-		if c.validService(service) {
+		if _, ok := service.Spec.Annotations.Labels[serviceLabel]; ok {
+			swarmUpdaterService = service
+			continue
+		}
 
-			// try to identify this service
-			if _, ok := service.Spec.Annotations.Labels[serviceLabel]; ok {
-				serviceID = service.ID
+		serviceQueue = append(serviceQueue, service)
+	}
 
-				continue
-			}
+	// only create as many as we need
+	threads := c.MaxThreads
+	if len(serviceQueue) < threads {
+		threads = len(serviceQueue)
+	}
 
-			if len(imageName) > 0 {
-				hasMatch := false
-				for _, imageMatch := range imageName {
-					if strings.HasPrefix(service.Spec.TaskTemplate.ContainerSpec.Image, imageMatch) {
-						hasMatch = true
+	log.Printf("starting %d threads", threads)
 
-						break
+	for i := 0; i < threads; i++ {
+		wg.Add(1)
+		go func(key int) {
+			defer wg.Done()
+			log.Printf("starting thread %d", key)
+
+			for {
+				if len(serviceQueue) == 0 {
+					log.Printf("exiting thread %d", key)
+					return
+				}
+
+				serviceLock.Lock()
+				service, newQueue := serviceQueue[0], serviceQueue[1:]
+				serviceQueue = newQueue
+				serviceLock.Unlock()
+
+				if !c.validService(service) {
+					log.Debug("Service %s was ignored by blacklist or missing label", service.Spec.Name)
+					return
+				}
+
+				if len(imageName) > 0 {
+					hasMatch := false
+					for _, imageMatch := range imageName {
+						if strings.HasPrefix(service.Spec.TaskTemplate.ContainerSpec.Image, imageMatch) {
+							hasMatch = true
+							break
+						}
+					}
+
+					if !hasMatch {
+						return
 					}
 				}
 
-				if !hasMatch {
-					continue
+				if err = c.updateService(ctx, service); err != nil {
+					if ctx.Err() == context.Canceled {
+						log.Printf("Service update canceled")
+						return
+					}
+
+					log.Printf("Cannot update service %s: %s", service.Spec.Name, err.Error())
 				}
 			}
+		}(i)
+	}
 
-			if err = c.updateService(ctx, service); err != nil {
-				if ctx.Err() == context.Canceled {
-					log.Printf("Service update canceled")
+	wg.Wait()
 
-					break
-				}
-				log.Printf("Cannot update service %s: %s", service.Spec.Name, err.Error())
+	// now update self
+	if swarmUpdaterService.ID != "na" && c.validService(swarmUpdaterService) {
+		if err := c.updateService(ctx, swarmUpdaterService); err != nil {
+			if ctx.Err() == context.Canceled {
+				log.Printf("Service update canceled")
+			} else {
+				log.Printf("Cannot update service %s: %s", swarmUpdaterService.Spec.Name, err.Error())
 			}
-		} else {
-			log.Debug("Service %s was ignored by blacklist or missing label", service.Spec.Name)
 		}
 	}
 
-	if serviceID != "" {
-		// refresh service
-		service, _, err := c.client.ServiceInspectWithRaw(ctx, serviceID, types.ServiceInspectOptions{})
-		if err != nil {
-			return fmt.Errorf("cannot inspect the service %s: %w", serviceID, err)
-		}
+	if servicesUpdated > 0 {
+		c.shoutrrr.Enqueue(fmt.Sprintf("approx %d services updated", servicesUpdated))
+		c.shoutrrr.Flush(shoutrrrParams)
 
-		err = c.updateService(ctx, service)
-		if err != nil {
-			return fmt.Errorf("failed to update the service %s: %w", serviceID, err)
-		}
+		// now reset the counter back to 0
+		servicesUpdated = 0
 	}
 
+	log.Printf("done")
 	return nil
 }
 
